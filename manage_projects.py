@@ -19,6 +19,10 @@ ROOT_DIR = os.getenv("ROOT_DIR", "/mnt/d/lab/gitlab-work")
 CSV_NAME = os.getenv("CSV_NAME", "project_mapping.csv")
 CSV_PATH = os.path.join(ROOT_DIR, CSV_NAME)
 
+# 逾時設定 (秒)
+CLONE_TIMEOUT = int(os.getenv("CLONE_TIMEOUT", "3600"))
+PULL_TIMEOUT = int(os.getenv("PULL_TIMEOUT", "600"))
+
 CSV_FIELDS = ["project_id", "project_name", "project_desc", "project_map_path", "cloned", "timeout", "http_url"]
 
 def get_all_gitlab_projects() -> List[Dict]:
@@ -125,7 +129,7 @@ def git_batch_op(rows: List[Dict], op_type: str = "clone"):
                 subprocess.run([
                     "git", "-c", "http.sslVerify=false", 
                     "clone", "--quiet", "--depth", "1", auth_url, local_path
-                ], check=True, timeout=300)
+                ], check=True, timeout=CLONE_TIMEOUT)
                 row["cloned"] = "true"
                 row["timeout"] = "false"
             except subprocess.TimeoutExpired:
@@ -144,7 +148,7 @@ def git_batch_op(rows: List[Dict], op_type: str = "clone"):
                 subprocess.run([
                     "git", "-c", "http.sslVerify=false", 
                     "-C", local_path, "pull", "--quiet"
-                ], check=True, timeout=120)
+                ], check=True, timeout=PULL_TIMEOUT)
                 row["timeout"] = "false" # 成功則清除逾時標記
             except subprocess.TimeoutExpired:
                 print(f"  Pull 逾時: {p_name}")
