@@ -104,15 +104,14 @@ def git_batch_op(rows: List[Dict], op_type: str = "clone"):
         p_name = row["project_name"]
         http_url = row["http_url"]
         
-        # 跳過 timeout 標記的專案 (除非是 pull)
-        if op_type == "clone" and row.get("timeout", "").lower() == "true":
-            continue
-
         # 設定認證 URL
         auth_url = http_url.replace("https://", f"https://oauth2:{PRIVATE_TOKEN}@")
         
         if op_type == "clone":
+            # 如果已經有 .git 目錄，表示已下載成功，跳過
             if os.path.isdir(os.path.join(local_path, ".git")):
+                row["cloned"] = "true"
+                row["timeout"] = "false"
                 continue
             
             print(f"[{i+1}/{total}] 正在 Clone: {p_name}")
@@ -138,7 +137,6 @@ def git_batch_op(rows: List[Dict], op_type: str = "clone"):
         
         elif op_type == "pull":
             if not os.path.isdir(os.path.join(local_path, ".git")):
-                print(f"[{i+1}/{total}] 跳過 Pull (未下載): {p_name}")
                 continue
             
             print(f"[{i+1}/{total}] 正在 Pull: {p_name}")
@@ -147,6 +145,10 @@ def git_batch_op(rows: List[Dict], op_type: str = "clone"):
                     "git", "-c", "http.sslVerify=false", 
                     "-C", local_path, "pull", "--quiet"
                 ], check=True, timeout=120)
+                row["timeout"] = "false" # 成功則清除逾時標記
+            except subprocess.TimeoutExpired:
+                print(f"  Pull 逾時: {p_name}")
+                row["timeout"] = "true"
             except Exception as e:
                 print(f"  Pull 失敗: {p_name} ({e})")
 
