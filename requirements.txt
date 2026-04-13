@@ -1,0 +1,4 @@
+python-gitlab
+python-dotenv
+urllib3
+gitpython
