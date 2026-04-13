@@ -7,12 +7,14 @@
 - **續傳支援**：透過 CSV 對應表記錄進度，支援中斷後續傳。
 - **目錄組織**：依據 GitLab 的 Namespace 自動建立本地目錄結構。
 - **對應表管理**：產生並同步 `project_id`, `project_name`, `local_path` 的對應表。
+- **uv 管理**：使用 [uv](https://github.com/astral-sh/uv) 進行快速且可靠的 Python 專案管理。
 
 ## 快速開始
 
-### 1. 安裝依賴
+### 1. 安裝環境
+確保您已安裝 `uv`，然後執行：
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
 
 ### 2. 設定環境變數
@@ -22,17 +24,18 @@ cp .env.example .env
 ```
 
 ### 3. 執行腳本
+使用 `uv run` 執行對應的任務：
 - **初次克隆所有專案**：
   ```bash
-  python clone_gitlab_projects.py
+  uv run clone_gitlab_projects.py
   ```
 - **產生詳細專案清單**：
   ```bash
-  python generate_project_list.py
+  uv run generate_project_list.py
   ```
 - **同步遺漏的克隆任務**：
   ```bash
-  python sync_projects_from_csv.py
+  uv run sync_projects_from_csv.py
   ```
 
 ## 注意事項
@@ -43,6 +46,8 @@ cp .env.example .env
 ## 專案結構
 ```text
 gitlab-project-mapping/
+├── pyproject.toml             # uv 專案定義
+├── uv.lock                    # uv 鎖定檔
 ├── clone_gitlab_projects.py   # 核心克隆邏輯
 ├── generate_project_list.py   # 產生詳細對應清單
 ├── sync_projects_from_csv.py  # 依據清單同步克隆
