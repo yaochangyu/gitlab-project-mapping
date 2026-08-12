@@ -23,3 +23,7 @@ project_mapping_v2.csv
 # User specific
 .creds
 credentials
+
+# OMC local state
+.omc/
+.omo/
