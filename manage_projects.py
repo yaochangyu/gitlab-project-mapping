@@ -2,10 +2,11 @@ import os
 import csv
 import subprocess
 import shutil
-import requests
 import argparse
+import json
 from typing import List, Dict
 from dotenv import load_dotenv
+from urllib.parse import urlparse
 
 # 載入 .env 檔案
 load_dotenv()
@@ -25,31 +26,39 @@ PULL_TIMEOUT = int(os.getenv("PULL_TIMEOUT", "600"))
 
 CSV_FIELDS = ["project_id", "project_name", "project_desc", "project_map_path", "cloned", "timeout", "http_url"]
 
+
+def _gitlab_hostname() -> str:
+    parsed = urlparse(GITLAB_URL)
+    return parsed.hostname or GITLAB_URL
+
+
+def _git_credential_helper() -> str:
+    hostname = _gitlab_hostname()
+    return f"!f() {{ GITLAB_HOST={hostname} glab auth git-credential \"$@\"; }}; f"
+
 def get_all_gitlab_projects() -> List[Dict]:
     """從 GitLab API 抓取所有專案資訊"""
     projects = []
-    page = 1
-    per_page = 100
-    
+    hostname = _gitlab_hostname()
+
     print(f"正在從 {GITLAB_URL} 抓取專案資訊...")
-    while True:
-        api_url = f"{GITLAB_URL}/api/v4/projects"
-        headers = {"PRIVATE-TOKEN": PRIVATE_TOKEN}
-        params = {"page": page, "per_page": per_page, "simple": "true", "membership": "true"}
-        
-        response = requests.get(api_url, headers=headers, params=params, verify=False)
-        if response.status_code != 200:
-            print(f"抓取失敗: {response.status_code} - {response.text}")
-            break
-            
-        batch = response.json()
-        if not batch:
-            break
-            
-        projects.extend(batch)
-        print(f"已抓取 {len(projects)} 個專案...")
-        page += 1
-        
+
+    cmd = ["glab", "api", "--hostname", hostname, "--paginate", "--output", "ndjson", "projects?simple=true"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"抓取失敗: {result.stderr.strip()}")
+        return projects
+
+    try:
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                continue
+            projects.append(json.loads(line))
+    except json.JSONDecodeError as e:
+        print(f"抓取失敗: 無法解析 glab 輸出 ({e})")
+        return projects
+
+    print(f"已抓取 {len(projects)} 個專案...")
     return projects
 
 def sync_csv_with_api(projects: List[Dict], overwrite: bool = False):
@@ -107,9 +116,7 @@ def git_batch_op(rows: List[Dict], op_type: str = "clone"):
         local_path = row["project_map_path"]
         p_name = row["project_name"]
         http_url = row["http_url"]
-        
-        # 設定認證 URL
-        auth_url = http_url.replace("https://", f"https://oauth2:{PRIVATE_TOKEN}@")
+        cred_helper = _git_credential_helper()
         
         if op_type == "clone":
             # 如果已經有 .git 目錄，表示已下載成功，跳過
@@ -128,7 +135,8 @@ def git_batch_op(rows: List[Dict], op_type: str = "clone"):
             try:
                 subprocess.run([
                     "git", "-c", "http.sslVerify=false", 
-                    "clone", "--quiet", "--depth", "1", auth_url, local_path
+                    "-c", f"credential.https://{_gitlab_hostname()}.helper={cred_helper}",
+                    "clone", "--quiet", "--depth", "1", http_url, local_path
                 ], check=True, timeout=CLONE_TIMEOUT)
                 row["cloned"] = "true"
                 row["timeout"] = "false"
@@ -142,11 +150,23 @@ def git_batch_op(rows: List[Dict], op_type: str = "clone"):
         elif op_type == "pull":
             if not os.path.isdir(os.path.join(local_path, ".git")):
                 continue
+
+            has_head = subprocess.run(
+                ["git", "-C", local_path, "rev-parse", "--verify", "HEAD"],
+                capture_output=True,
+                text=True,
+            )
+            if has_head.returncode != 0:
+                print(f"  跳過 Pull（尚未有提交）: {p_name}")
+                row["timeout"] = "false"
+                row["cloned"] = "true"
+                continue
             
             print(f"[{i+1}/{total}] 正在 Pull: {p_name}")
             try:
                 subprocess.run([
                     "git", "-c", "http.sslVerify=false", 
+                    "-c", f"credential.https://{_gitlab_hostname()}.helper={cred_helper}",
                     "-C", local_path, "pull", "--quiet"
                 ], check=True, timeout=PULL_TIMEOUT)
                 row["timeout"] = "false" # 成功則清除逾時標記
