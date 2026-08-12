@@ -26,7 +26,6 @@ def final_sync():
     for i, row in enumerate(rows):
         local_path = row["project_map_path"]
         
-        # 檢查是否其實已經克隆好了
         if os.path.isdir(os.path.join(local_path, ".git")):
             if row["cloned"] != "true":
                 row["cloned"] = "true"
@@ -34,7 +33,6 @@ def final_sync():
                 changed = True
             continue
 
-        # 如果沒下載好，嘗試下載
         p_name = row["project_name"]
         print(f"[{i+1}/{total}] 重新同步: {p_name}...")
         
@@ -56,9 +54,7 @@ def final_sync():
         except Exception as e:
             print(f"  [失敗] {e}")
             row["cloned"] = "false"
-            # 這裡不主動標記 timeout，讓使用者決定
         
-        # 每次有變更就存檔
         with open(CSV_PATH, mode='w', encoding='utf-8', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
             writer.writeheader()

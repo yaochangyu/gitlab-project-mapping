@@ -17,7 +17,6 @@ def sync_clones():
         return
 
     rows = []
-    # 使用 utf-8-sig 讀取
     with open(CSV_PATH, mode='r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         rows = list(reader)
@@ -60,7 +59,6 @@ def sync_clones():
         row["timeout"] = "true" if timed_out else "false"
         
         if success or timed_out:
-            # 使用 utf-8-sig 寫入
             with open(CSV_PATH, mode='w', encoding='utf-8-sig', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
                 writer.writeheader()

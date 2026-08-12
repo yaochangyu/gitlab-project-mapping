@@ -8,7 +8,6 @@ import time
 from config import GITLAB_URL, PRIVATE_TOKEN, ROOT_DIR, CSV_PATH
 
 def load_existing_mapping():
-    """讀取現有的 CSV 對應表，以便續傳"""
     mapping = {}
     if os.path.exists(CSV_PATH):
         try:
@@ -21,7 +20,6 @@ def load_existing_mapping():
     return mapping
 
 def write_csv(mapping_list):
-    """將目前的對應列表完整寫入 CSV"""
     with open(CSV_PATH, mode='w', encoding='utf-8', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=["project id", "project name", "project local path"])
         writer.writeheader()
@@ -36,7 +34,6 @@ def clone_projects():
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     gl = gitlab.Gitlab(GITLAB_URL, private_token=PRIVATE_TOKEN, ssl_verify=False)
     
-    # 載入已完成的進度
     existing_mapping = load_existing_mapping()
     mapping_list = list(existing_mapping.values())
     print(f"已載入 {len(existing_mapping)} 個現有記錄，準備續傳...")
@@ -50,7 +47,6 @@ def clone_projects():
 
     count = 0
     for project in projects:
-        # 如果 ID 已在 CSV 且目錄存在，則快速跳過
         if project.id in existing_mapping:
             local_path = existing_mapping[project.id]["project local path"]
             if os.path.exists(os.path.join(local_path, ".git")):
@@ -65,17 +61,14 @@ def clone_projects():
         
         print(f"處理: {group_name}/{project_slug} (ID: {project.id})...")
         
-        # 執行克隆 (若不存在)
         if not os.path.exists(os.path.join(local_path, ".git")):
             os.makedirs(parent_dir, exist_ok=True)
             auth_url = project.http_url_to_repo.replace("https://", f"https://oauth2:{PRIVATE_TOKEN}@")
             
-            # 如果目錄已存在但非 git repo，清理它
             if os.path.exists(local_path):
                 shutil.rmtree(local_path, ignore_errors=True)
                 
             try:
-                # 設定 120 秒超時，避免卡死在超大型專案
                 subprocess.run([
                     "git", "-c", "http.sslVerify=false", 
                     "clone", "--quiet", "--depth", "1", auth_url, local_path
@@ -86,7 +79,6 @@ def clone_projects():
                 if os.path.exists(local_path):
                     shutil.rmtree(local_path, ignore_errors=True)
         
-        # 不論克隆成功與否，都記錄到 CSV 中以標記已處理
         if project.id not in existing_mapping:
             new_row = {
                 "project id": project.id,

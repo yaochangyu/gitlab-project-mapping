@@ -10,7 +10,6 @@ def load_existing_mapping():
     mapping = {}
     if os.path.exists(CSV_PATH):
         try:
-            # 使用 utf-8-sig 讀取以支援 BOM
             with open(CSV_PATH, mode='r', encoding='utf-8-sig') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
@@ -71,7 +70,6 @@ def generate_list():
         })
 
     fields = ["project_id", "project_name", "project_desc", "project_map_path", "cloned", "timeout", "http_url"]
-    # 使用 utf-8-sig 寫入以解決 Excel 亂碼問題
     with open(CSV_PATH, mode='w', encoding='utf-8-sig', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
