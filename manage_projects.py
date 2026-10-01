@@ -25,7 +25,10 @@ CLONE_TIMEOUT = int(os.getenv("CLONE_TIMEOUT", "3600"))
 PULL_TIMEOUT = int(os.getenv("PULL_TIMEOUT", "600"))
 STALE_LOCK_SECONDS = int(os.getenv("STALE_LOCK_SECONDS", "3600"))
 
-CSV_FIELDS = ["project_id", "project_name", "project_desc", "project_map_path", "cloned", "timeout", "http_url"]
+CSV_FIELDS = ["project_id", "project_name", "project_desc", "project_map_path", "cloned", "timeout", "http_url", "branch"]
+
+# 已知工具暫存資料夾，判斷未提交變更時排除
+IGNORED_UNTRACKED_DIRS = (".omc", ".omo", ".claude", ".code-review-graph", ".obsidian", "graphify-out")
 
 
 def _gitlab_hostname() -> str:
@@ -110,6 +113,103 @@ def _run_pull(local_path: str, cred_helper: str) -> subprocess.CompletedProcess[
     )
 
 
+def _current_branch(local_path: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", local_path, "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _has_uncommitted_changes(local_path: str) -> bool:
+    result = subprocess.run(
+        ["git", "-C", local_path, "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+    )
+    for line in result.stdout.splitlines():
+        status, _, rest = line.partition(" ")
+        path = rest.strip()
+        if status == "??" and path.split("/")[0] in IGNORED_UNTRACKED_DIRS:
+            continue
+        if line.strip():
+            return True
+    return False
+
+
+def _fetch(local_path: str, cred_helper: str) -> bool:
+    result = subprocess.run(
+        [
+            "git", "-c", "http.sslVerify=false",
+            "-c", f"credential.https://{_gitlab_hostname()}.helper={cred_helper}",
+            "-C", local_path, "fetch", "--quiet", "origin",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=PULL_TIMEOUT,
+    )
+    return result.returncode == 0
+
+
+def _resolve_target_branch(local_path: str) -> str:
+    """main 優先，其次 master，再其次 Main；本地或 origin 任一存在即可。找不到回傳空字串。"""
+    for branch in ("main", "master", "Main"):
+        local_ref = subprocess.run(
+            ["git", "-C", local_path, "rev-parse", "--verify", "--quiet", branch],
+            capture_output=True, text=True,
+        )
+        remote_ref = subprocess.run(
+            ["git", "-C", local_path, "rev-parse", "--verify", "--quiet", f"origin/{branch}"],
+            capture_output=True, text=True,
+        )
+        if local_ref.returncode == 0 or remote_ref.returncode == 0:
+            return branch
+    return ""
+
+
+def _checkout_target_branch(local_path: str, target_branch: str) -> bool:
+    has_local = subprocess.run(
+        ["git", "-C", local_path, "rev-parse", "--verify", "--quiet", target_branch],
+        capture_output=True, text=True,
+    ).returncode == 0
+
+    if has_local:
+        result = subprocess.run(
+            ["git", "-C", local_path, "checkout", target_branch],
+            capture_output=True, text=True,
+        )
+    else:
+        result = subprocess.run(
+            ["git", "-C", local_path, "checkout", "-b", target_branch, f"origin/{target_branch}"],
+            capture_output=True, text=True,
+        )
+    return result.returncode == 0
+
+
+def ensure_target_branch(local_path: str, p_name: str, cred_helper: str) -> None:
+    """
+    依 AGENTS.md「各子專案取分支規則」切到 main/master（找不到條件就跳過，不強制）。
+    只負責切換，不 pull；pull 交由呼叫端的既有邏輯（含 stale lock 重試）處理。
+    """
+    if _has_uncommitted_changes(local_path):
+        print(f"  跳過切換（未提交變更）: {p_name}")
+        return
+
+    if not _fetch(local_path, cred_helper):
+        print(f"  跳過切換（fetch 失敗）: {p_name}")
+        return
+
+    target_branch = _resolve_target_branch(local_path)
+    if not target_branch:
+        print(f"  跳過切換（找不到 main/master/Main）: {p_name}")
+        return
+
+    if _current_branch(local_path) != target_branch:
+        if not _checkout_target_branch(local_path, target_branch):
+            print(f"  切換分支失敗: {p_name} -> {target_branch}")
+
+
 def build_rows(projects: List[Dict]) -> List[Dict]:
     rows = []
     for p in projects:
@@ -122,7 +222,8 @@ def build_rows(projects: List[Dict]) -> List[Dict]:
             "project_map_path": local_path,
             "cloned": "true" if is_cloned(local_path) else "false",
             "timeout": "false",
-            "http_url": p["http_url_to_repo"]
+            "http_url": p["http_url_to_repo"],
+            "branch": _current_branch(local_path) if is_cloned(local_path) else "",
         })
     return rows
 
@@ -168,6 +269,7 @@ def git_batch_op(rows: List[Dict], op_type: str = "clone"):
                 ], check=True, timeout=CLONE_TIMEOUT)
                 row["cloned"] = "true"
                 row["timeout"] = "false"
+                row["branch"] = _current_branch(local_path)
             except subprocess.TimeoutExpired:
                 print(f"  逾時: {p_name}")
                 row["timeout"] = "true"
@@ -188,7 +290,10 @@ def git_batch_op(rows: List[Dict], op_type: str = "clone"):
                 print(f"  跳過 Pull（尚未有提交）: {p_name}")
                 row["timeout"] = "false"
                 row["cloned"] = "true"
+                row["branch"] = _current_branch(local_path)
                 continue
+
+            ensure_target_branch(local_path, p_name, cred_helper)
 
             print(f"[{i+1}/{total}] 正在 Pull: {p_name}")
             try:
@@ -211,6 +316,8 @@ def git_batch_op(rows: List[Dict], op_type: str = "clone"):
             except subprocess.TimeoutExpired:
                 print(f"  Pull 逾時: {p_name}")
                 row["timeout"] = "true"
+            finally:
+                row["branch"] = _current_branch(local_path)
 
     if op_type == "pull" and pull_failures:
         print(f"\nPull 失敗摘要：共 {len(pull_failures)} 個專案")
