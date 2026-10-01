@@ -4,7 +4,9 @@ import subprocess
 import shutil
 import argparse
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict
 from dotenv import load_dotenv
 from urllib.parse import urlparse
@@ -24,6 +26,7 @@ CSV_PATH = os.path.join(ROOT_DIR, CSV_NAME)
 CLONE_TIMEOUT = int(os.getenv("CLONE_TIMEOUT", "3600"))
 PULL_TIMEOUT = int(os.getenv("PULL_TIMEOUT", "600"))
 STALE_LOCK_SECONDS = int(os.getenv("STALE_LOCK_SECONDS", "3600"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
 
 CSV_FIELDS = ["project_id", "project_name", "project_desc", "project_map_path", "cloned", "timeout", "http_url", "branch"]
 
@@ -92,20 +95,10 @@ def _is_stale_index_lock(local_path: str) -> bool:
     return (time.time() - os.path.getmtime(lock_path)) > STALE_LOCK_SECONDS
 
 
-def _run_pull(local_path: str, cred_helper: str) -> subprocess.CompletedProcess[str]:
+def _merge_ff_only(local_path: str, ref: str = "@{u}") -> subprocess.CompletedProcess[str]:
+    """對已 fetch 過的本地 repo 做 fast-forward merge，不再重複 fetch。"""
     return subprocess.run(
-        [
-            "git",
-            "-c",
-            "http.sslVerify=false",
-            "-c",
-            f"credential.https://{_gitlab_hostname()}.helper={cred_helper}",
-            "-C",
-            local_path,
-            "pull",
-            "--quiet",
-            "--ff-only",
-        ],
+        ["git", "-C", local_path, "merge", "--ff-only", "--quiet", ref],
         capture_output=True,
         check=False,
         text=True,
@@ -187,27 +180,22 @@ def _checkout_target_branch(local_path: str, target_branch: str) -> bool:
     return result.returncode == 0
 
 
-def ensure_target_branch(local_path: str, p_name: str, cred_helper: str) -> None:
+def ensure_target_branch(local_path: str, p_name: str) -> str:
     """
     依 AGENTS.md「各子專案取分支規則」切到 main/master（找不到條件就跳過，不強制）。
-    只負責切換，不 pull；pull 交由呼叫端的既有邏輯（含 stale lock 重試）處理。
+    只負責切換，不 pull。呼叫前必須已完成 fetch。
+    回傳用於後續 merge 的 ref："origin/<branch>"，找不到就回傳空字串（呼叫端改用 @{u}）。
     """
-    if _has_uncommitted_changes(local_path):
-        print(f"  跳過切換（未提交變更）: {p_name}")
-        return
-
-    if not _fetch(local_path, cred_helper):
-        print(f"  跳過切換（fetch 失敗）: {p_name}")
-        return
-
     target_branch = _resolve_target_branch(local_path)
     if not target_branch:
-        print(f"  跳過切換（找不到 main/master/Main）: {p_name}")
-        return
+        return ""
 
     if _current_branch(local_path) != target_branch:
         if not _checkout_target_branch(local_path, target_branch):
             print(f"  切換分支失敗: {p_name} -> {target_branch}")
+            return ""
+
+    return f"origin/{target_branch}"
 
 
 def build_rows(projects: List[Dict]) -> List[Dict]:
@@ -236,88 +224,116 @@ def write_csv(rows: List[Dict]) -> None:
     cloned_count = sum(1 for r in rows if r["cloned"] == "true")
     print(f"CSV 已輸出：{CSV_PATH}（共 {len(rows)} 個專案，已下載 {cloned_count} 個）")
 
+def _clone_row(row: Dict) -> None:
+    local_path = row["project_map_path"]
+    p_name = row["project_name"]
+    http_url = row["http_url"]
+    cred_helper = _git_credential_helper()
+
+    if is_cloned(local_path):
+        row["cloned"] = "true"
+        row["timeout"] = "false"
+        return
+
+    print(f"正在 Clone: {p_name}")
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+    # 目錄存在但不是 git 庫，代表上次 clone 中斷，殘骸會讓 git clone 失敗
+    if os.path.exists(local_path):
+        shutil.rmtree(local_path, ignore_errors=True)
+
+    try:
+        subprocess.run([
+            "git", "-c", "http.sslVerify=false",
+            "-c", f"credential.https://{_gitlab_hostname()}.helper={cred_helper}",
+            "clone", "--quiet", "--depth", "1", http_url, local_path
+        ], check=True, timeout=CLONE_TIMEOUT)
+        row["cloned"] = "true"
+        row["timeout"] = "false"
+        row["branch"] = _current_branch(local_path)
+    except subprocess.TimeoutExpired:
+        print(f"  逾時: {p_name}")
+        row["timeout"] = "true"
+    except Exception as e:
+        print(f"  失敗: {p_name} ({e})")
+        row["cloned"] = "false"
+
+
+def _pull_row(row: Dict, pull_failures: list, lock: threading.Lock) -> None:
+    local_path = row["project_map_path"]
+    p_name = row["project_name"]
+    cred_helper = _git_credential_helper()
+
+    if not is_cloned(local_path):
+        return
+
+    has_head = subprocess.run(
+        ["git", "-C", local_path, "rev-parse", "--verify", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    if has_head.returncode != 0:
+        print(f"  跳過 Pull（尚未有提交）: {p_name}")
+        row["timeout"] = "false"
+        row["cloned"] = "true"
+        row["branch"] = _current_branch(local_path)
+        return
+
+    if _has_uncommitted_changes(local_path):
+        print(f"  跳過（未提交變更）: {p_name}")
+        row["branch"] = _current_branch(local_path)
+        return
+
+    if not _fetch(local_path, cred_helper):
+        print(f"  Fetch 失敗: {p_name}")
+        with lock:
+            pull_failures.append((p_name, "fetch failed"))
+        row["branch"] = _current_branch(local_path)
+        return
+
+    merge_ref = ensure_target_branch(local_path, p_name) or "@{u}"
+
+    print(f"正在更新: {p_name}")
+    try:
+        result = _merge_ff_only(local_path, merge_ref)
+        if result.returncode != 0 and "index.lock" in (result.stderr or "") and _is_stale_index_lock(local_path):
+            try:
+                os.remove(_index_lock_path(local_path))
+            except FileNotFoundError:
+                pass
+            result = _merge_ff_only(local_path, merge_ref)
+
+        if result.returncode == 0:
+            row["timeout"] = "false"  # 成功則清除逾時標記
+        else:
+            detail = _first_line(result.stderr or result.stdout or "")
+            if not detail:
+                detail = "pull failed"
+            print(f"  Pull 失敗: {p_name} ({detail})")
+            with lock:
+                pull_failures.append((p_name, detail))
+    except subprocess.TimeoutExpired:
+        print(f"  Pull 逾時: {p_name}")
+        row["timeout"] = "true"
+    finally:
+        row["branch"] = _current_branch(local_path)
+
+
 def git_batch_op(rows: List[Dict], op_type: str = "clone"):
     """
-    op_type: "clone" 或 "pull"
+    op_type: "clone" 或 "pull"。MAX_WORKERS 個執行緒平行處理各專案（I/O bound）。
     """
-    total = len(rows)
-    pull_failures = []
-    for i, row in enumerate(rows):
-        local_path = row["project_map_path"]
-        p_name = row["project_name"]
-        http_url = row["http_url"]
-        cred_helper = _git_credential_helper()
-        
+    pull_failures: list = []
+    lock = threading.Lock()
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         if op_type == "clone":
-            if is_cloned(local_path):
-                row["cloned"] = "true"
-                row["timeout"] = "false"
-                continue
-            
-            print(f"[{i+1}/{total}] 正在 Clone: {p_name}")
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            
-            # 目錄存在但不是 git 庫，代表上次 clone 中斷，殘骸會讓 git clone 失敗
-            if os.path.exists(local_path):
-                shutil.rmtree(local_path, ignore_errors=True)
-            
-            try:
-                subprocess.run([
-                    "git", "-c", "http.sslVerify=false", 
-                    "-c", f"credential.https://{_gitlab_hostname()}.helper={cred_helper}",
-                    "clone", "--quiet", "--depth", "1", http_url, local_path
-                ], check=True, timeout=CLONE_TIMEOUT)
-                row["cloned"] = "true"
-                row["timeout"] = "false"
-                row["branch"] = _current_branch(local_path)
-            except subprocess.TimeoutExpired:
-                print(f"  逾時: {p_name}")
-                row["timeout"] = "true"
-            except Exception as e:
-                print(f"  失敗: {p_name} ({e})")
-                row["cloned"] = "false"
-        
-        elif op_type == "pull":
-            if not is_cloned(local_path):
-                continue
+            futures = [executor.submit(_clone_row, row) for row in rows]
+        else:
+            futures = [executor.submit(_pull_row, row, pull_failures, lock) for row in rows]
 
-            has_head = subprocess.run(
-                ["git", "-C", local_path, "rev-parse", "--verify", "HEAD"],
-                capture_output=True,
-                text=True,
-            )
-            if has_head.returncode != 0:
-                print(f"  跳過 Pull（尚未有提交）: {p_name}")
-                row["timeout"] = "false"
-                row["cloned"] = "true"
-                row["branch"] = _current_branch(local_path)
-                continue
-
-            ensure_target_branch(local_path, p_name, cred_helper)
-
-            print(f"[{i+1}/{total}] 正在 Pull: {p_name}")
-            try:
-                result = _run_pull(local_path, cred_helper)
-                if result.returncode != 0 and "index.lock" in (result.stderr or "") and _is_stale_index_lock(local_path):
-                    try:
-                        os.remove(_index_lock_path(local_path))
-                    except FileNotFoundError:
-                        pass
-                    result = _run_pull(local_path, cred_helper)
-
-                if result.returncode == 0:
-                    row["timeout"] = "false" # 成功則清除逾時標記
-                else:
-                    detail = _first_line(result.stderr or result.stdout or "")
-                    if not detail:
-                        detail = "pull failed"
-                    print(f"  Pull 失敗: {p_name} ({detail})")
-                    pull_failures.append((p_name, detail))
-            except subprocess.TimeoutExpired:
-                print(f"  Pull 逾時: {p_name}")
-                row["timeout"] = "true"
-            finally:
-                row["branch"] = _current_branch(local_path)
+        for future in as_completed(futures):
+            future.result()  # 讓 worker 例外在主執行緒拋出，而非靜默吞掉
 
     if op_type == "pull" and pull_failures:
         print(f"\nPull 失敗摘要：共 {len(pull_failures)} 個專案")
