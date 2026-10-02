@@ -132,11 +132,15 @@ def _has_uncommitted_changes(local_path: str) -> bool:
 
 
 def _fetch(local_path: str, cred_helper: str) -> bool:
+    # 明確帶 refspec：--depth clone 預設啟用 --single-branch，會把 .git/config 的
+    # remote.origin.fetch 鎖死成只抓當初 clone 的分支；遠端改名/遷移預設分支後，
+    # 不帶 refspec 的 fetch 會因為舊分支名稱消失而失敗。這裡強制抓全部分支。
     result = subprocess.run(
         [
             "git", "-c", "http.sslVerify=false",
             "-c", f"credential.https://{_gitlab_hostname()}.helper={cred_helper}",
             "-C", local_path, "fetch", "--quiet", "origin",
+            "+refs/heads/*:refs/remotes/origin/*",
         ],
         capture_output=True,
         text=True,
@@ -145,27 +149,41 @@ def _fetch(local_path: str, cred_helper: str) -> bool:
     return result.returncode == 0
 
 
+def _list_branch_names(local_path: str) -> tuple:
+    """
+    精確（大小寫敏感）列出本地與 origin 的分支名稱。
+    工作區位於 WSL mount 的 Windows NTFS（/mnt/d/...），檔案系統不分大小寫，
+    `git rev-parse --verify <name>` 在這種環境下會把 main/Main 互相誤判為存在，
+    必須改用 for-each-ref 的 refname 字串做精確比對。
+    """
+    result = subprocess.run(
+        ["git", "-C", local_path, "for-each-ref", "--format=%(refname)",
+         "refs/heads", "refs/remotes/origin"],
+        capture_output=True, text=True,
+    )
+    local_names, remote_names = set(), set()
+    for line in result.stdout.splitlines():
+        if line.startswith("refs/heads/"):
+            local_names.add(line[len("refs/heads/"):])
+        elif line.startswith("refs/remotes/origin/"):
+            name = line[len("refs/remotes/origin/"):]
+            if name != "HEAD":
+                remote_names.add(name)
+    return local_names, remote_names
+
+
 def _resolve_target_branch(local_path: str) -> str:
-    """main 優先，其次 master，再其次 Main；本地或 origin 任一存在即可。找不到回傳空字串。"""
+    """main 優先，其次 master，再其次 Main；本地或 origin 任一精確存在即可。找不到回傳空字串。"""
+    local_names, remote_names = _list_branch_names(local_path)
     for branch in ("main", "master", "Main"):
-        local_ref = subprocess.run(
-            ["git", "-C", local_path, "rev-parse", "--verify", "--quiet", branch],
-            capture_output=True, text=True,
-        )
-        remote_ref = subprocess.run(
-            ["git", "-C", local_path, "rev-parse", "--verify", "--quiet", f"origin/{branch}"],
-            capture_output=True, text=True,
-        )
-        if local_ref.returncode == 0 or remote_ref.returncode == 0:
+        if branch in local_names or branch in remote_names:
             return branch
     return ""
 
 
 def _checkout_target_branch(local_path: str, target_branch: str) -> bool:
-    has_local = subprocess.run(
-        ["git", "-C", local_path, "rev-parse", "--verify", "--quiet", target_branch],
-        capture_output=True, text=True,
-    ).returncode == 0
+    local_names, _ = _list_branch_names(local_path)
+    has_local = target_branch in local_names
 
     if has_local:
         result = subprocess.run(
