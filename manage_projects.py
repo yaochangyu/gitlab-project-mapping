@@ -135,18 +135,21 @@ def _fetch(local_path: str, cred_helper: str) -> bool:
     # 明確帶 refspec：--depth clone 預設啟用 --single-branch，會把 .git/config 的
     # remote.origin.fetch 鎖死成只抓當初 clone 的分支；遠端改名/遷移預設分支後，
     # 不帶 refspec 的 fetch 會因為舊分支名稱消失而失敗。這裡強制抓全部分支。
-    result = subprocess.run(
-        [
-            "git", "-c", "http.sslVerify=false",
-            "-c", f"credential.https://{_gitlab_hostname()}.helper={cred_helper}",
-            "-C", local_path, "fetch", "--quiet", "origin",
-            "+refs/heads/*:refs/remotes/origin/*",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=PULL_TIMEOUT,
-    )
-    return result.returncode == 0
+    try:
+        result = subprocess.run(
+            [
+                "git", "-c", "http.sslVerify=false",
+                "-c", f"credential.https://{_gitlab_hostname()}.helper={cred_helper}",
+                "-C", local_path, "fetch", "--quiet", "origin",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=PULL_TIMEOUT,
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
 
 
 def _list_branch_names(local_path: str) -> tuple:
@@ -355,15 +358,26 @@ def git_batch_op(rows: List[Dict], op_type: str = "clone"):
     """
     pull_failures: list = []
     lock = threading.Lock()
+    worker_errors: list = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         if op_type == "clone":
-            futures = [executor.submit(_clone_row, row) for row in rows]
+            future_to_row = {executor.submit(_clone_row, row): row for row in rows}
         else:
-            futures = [executor.submit(_pull_row, row, pull_failures, lock) for row in rows]
+            future_to_row = {executor.submit(_pull_row, row, pull_failures, lock): row for row in rows}
 
-        for future in as_completed(futures):
-            future.result()  # 讓 worker 例外在主執行緒拋出，而非靜默吞掉
+        for future in as_completed(future_to_row):
+            # 單一專案拋出未預期例外不應中斷其他 445 個專案，記錄下來最後統一報告
+            try:
+                future.result()
+            except Exception as e:
+                row = future_to_row[future]
+                worker_errors.append((row["project_name"], repr(e)))
+
+    if worker_errors:
+        print(f"\n未預期例外：共 {len(worker_errors)} 個專案")
+        for p_name, detail in worker_errors:
+            print(f"- {p_name}: {detail}")
 
     if op_type == "pull" and pull_failures:
         print(f"\nPull 失敗摘要：共 {len(pull_failures)} 個專案")
