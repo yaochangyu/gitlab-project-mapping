@@ -28,7 +28,7 @@ PULL_TIMEOUT = int(os.getenv("PULL_TIMEOUT", "600"))
 STALE_LOCK_SECONDS = int(os.getenv("STALE_LOCK_SECONDS", "3600"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
 
-CSV_FIELDS = ["project_id", "project_name", "project_desc", "project_map_path", "cloned", "timeout", "http_url", "branch"]
+CSV_FIELDS = ["project_id", "project_name", "project_desc", "project_map_path", "cloned", "timeout", "http_url", "branch", "all_branches"]
 
 # 已知工具暫存資料夾，判斷未提交變更時排除
 IGNORED_UNTRACKED_DIRS = (".omc", ".omo", ".claude", ".code-review-graph", ".obsidian", "graphify-out")
@@ -181,6 +181,12 @@ def _resolve_target_branch(local_path: str) -> str:
     return ""
 
 
+def _format_all_branches(local_path: str) -> str:
+    """本地與 origin 分支名稱聯集，排序後用 ; 分隔成單一字串，供 CSV 記錄完整分支清單。"""
+    local_names, remote_names = _list_branch_names(local_path)
+    return ";".join(sorted(local_names | remote_names))
+
+
 def _checkout_target_branch(local_path: str, target_branch: str) -> bool:
     local_names, _ = _list_branch_names(local_path)
     has_local = target_branch in local_names
@@ -230,6 +236,7 @@ def build_rows(projects: List[Dict]) -> List[Dict]:
             "timeout": "false",
             "http_url": p["http_url_to_repo"],
             "branch": _current_branch(local_path) if is_cloned(local_path) else "",
+            "all_branches": _format_all_branches(local_path) if is_cloned(local_path) else "",
         })
     return rows
 
@@ -269,6 +276,7 @@ def _clone_row(row: Dict) -> None:
         row["cloned"] = "true"
         row["timeout"] = "false"
         row["branch"] = _current_branch(local_path)
+        row["all_branches"] = _format_all_branches(local_path)
     except subprocess.TimeoutExpired:
         print(f"  逾時: {p_name}")
         row["timeout"] = "true"
@@ -295,11 +303,13 @@ def _pull_row(row: Dict, pull_failures: list, lock: threading.Lock) -> None:
         row["timeout"] = "false"
         row["cloned"] = "true"
         row["branch"] = _current_branch(local_path)
+        row["all_branches"] = _format_all_branches(local_path)
         return
 
     if _has_uncommitted_changes(local_path):
         print(f"  跳過（未提交變更）: {p_name}")
         row["branch"] = _current_branch(local_path)
+        row["all_branches"] = _format_all_branches(local_path)
         return
 
     if not _fetch(local_path, cred_helper):
@@ -307,6 +317,7 @@ def _pull_row(row: Dict, pull_failures: list, lock: threading.Lock) -> None:
         with lock:
             pull_failures.append((p_name, "fetch failed"))
         row["branch"] = _current_branch(local_path)
+        row["all_branches"] = _format_all_branches(local_path)
         return
 
     merge_ref = ensure_target_branch(local_path, p_name) or "@{u}"
@@ -335,6 +346,7 @@ def _pull_row(row: Dict, pull_failures: list, lock: threading.Lock) -> None:
         row["timeout"] = "true"
     finally:
         row["branch"] = _current_branch(local_path)
+        row["all_branches"] = _format_all_branches(local_path)
 
 
 def git_batch_op(rows: List[Dict], op_type: str = "clone"):
